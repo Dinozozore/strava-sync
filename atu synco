@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Strava Uploader (universel)</title>
+<meta name="theme-color" content="#ff5a36">
+<style>
+:root{--bg:#0f1013;--card:#17181c;--txt:#e8eaed;--muted:#9aa0a6;--bd:#2b2f36;--ac:#ff5a36}
+*{box-sizing:border-box;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+body{margin:0;background:linear-gradient(180deg,#0f1013,#0b0c0f 45%);color:var(--txt)}
+.wrap{max-width:760px;margin:0 auto;padding:24px}
+h1{font-size:22px;margin:4px 0 18px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:16px;margin:12px 0;box-shadow:0 8px 30px rgba(0,0,0,.35)}
+label{display:block;margin:10px 0 6px;color:var(--muted)}
+input[type="text"],input[type="password"]{width:100%;padding:12px;border-radius:10px;border:1px solid var(--bd);background:#111319;color:var(--txt)}
+input[type="file"]{width:100%}
+button{appearance:none;border:0;border-radius:12px;padding:12px 16px;background:var(--ac);color:#fff;font-weight:600;cursor:pointer}
+button.ghost{background:transparent;border:1px solid #3a4047;color:var(--txt)}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+small{color:var(--muted)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.ok{color:#37d67a}.err{color:#ff7b72}
+#log{white-space:pre-wrap;font-size:12px;line-height:1.45}
+hr{border:0;border-top:1px solid #2b2f36;margin:14px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🚀 Strava Uploader (universel)</h1>
+
+  <div class="card">
+    <div class="row"><b>Identifiants Strava</b><small>(stockés localement sur cet appareil)</small></div>
+    <label>Client ID</label><input id="cid" type="text" inputmode="numeric" placeholder="ex. 12345">
+    <label>Client Secret</label><input id="csec" type="password" placeholder="••••••••">
+    <label>Refresh Token</label><input id="rft" type="password" placeholder="votre refresh_token">
+    <div class="row" style="margin-top:12px">
+      <button id="save">💾 Enregistrer</button>
+      <button class="ghost" id="clear">🧹 Effacer</button>
+      <small id="cfgMsg"></small>
+    </div>
+  </div>
+
+  <div class="card">
+    <b>Envoyer des fichiers vers Strava</b>
+    <label>Fichiers d’activité (.fit, .gpx, .tcx)</label>
+    <input id="files" type="file" accept=".fit,.gpx,.tcx,application/octet-stream" multiple>
+    <div class="row" style="margin-top:12px">
+      <button id="upload">⬆️ Uploader</button>
+      <button class="ghost" id="check">🔎 Vérifier dernier statut</button>
+    </div>
+    <hr>
+    <div id="log" class="mono"></div>
+  </div>
+
+  <small>
+    Astuce : ajoute cette page à l’écran d’accueil (iOS) pour un accès ultra-rapide.<br>
+    Sécurité : rien n’est envoyé ailleurs que vers l’API Strava. Les clés restent en local (localStorage).
+  </small>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const log = (...m) => { $('#log').textContent += m.join(' ') + '\n'; };
+
+function loadCfg(){ try{ return JSON.parse(localStorage.getItem('strava_cfg')||'{}') }catch{ return {} } }
+function saveCfg(cfg){ localStorage.setItem('strava_cfg', JSON.stringify(cfg)); $('#cfgMsg').innerHTML='<span class="ok">✅ Enregistré.</span>'; }
+function fillCfg(){ const c=loadCfg(); $('#cid').value=c.client_id||''; $('#csec').value=c.client_secret||''; $('#rft').value=c.refresh_token||''; }
+
+async function refreshAccessToken(){
+  const c = loadCfg();
+  if(!c.client_id || !c.client_secret || !c.refresh_token) throw new Error('Renseigne Client ID, Secret et Refresh Token.');
+  const body = new URLSearchParams({
+    client_id: c.client_id, client_secret: c.client_secret,
+    grant_type: 'refresh_token', refresh_token: c.refresh_token
+  });
+  const r = await fetch('https://www.strava.com/oauth/token', {
+    method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body
+  });
+  const j = await r.json();
+  if(!r.ok){ throw new Error('Refresh token KO: '+(j.message||JSON.stringify(j))) }
+  return j.access_token;
+}
+
+function dataType(name){
+  const n=(name||'').toLowerCase();
+  if(n.endsWith('.gpx')) return 'gpx';
+  if(n.endsWith('.tcx')) return 'tcx';
+  return 'fit';
+}
+
+async function uploadFile(file, atk){
+  const fd = new FormData();
+  fd.append('file', file, file.name || 'activity.fit');
+  fd.append('data_type', dataType(file.name));
+  fd.append('name', file.name.replace(/\.(fit|gpx|tcx)$/i,''));
+  const r = await fetch('https://www.strava.com/api/v3/uploads', {
+    method:'POST', headers:{'Authorization':'Bearer '+atk}, body: fd
+  });
+  const j = await r.json();
+  if(!r.ok){ throw new Error(j.error || JSON.stringify(j)) }
+  localStorage.setItem('strava_last_upload', String(j.id));
+  return j; // {id,status,...}
+}
+
+async function checkLast(){
+  const id = localStorage.getItem('strava_last_upload');
+  if(!id){ log('ℹ️ Aucun upload récent.'); return; }
+  const atk = await refreshAccessToken();
+  const r = await fetch('https://www.strava.com/api/v3/uploads/'+id, {headers:{Authorization:'Bearer '+atk}});
+  const j = await r.json();
+  log('🔎 Upload',id,'→', j.status || '—', j.error?(' | erreur: '+j.error):'');
+}
+
+$('#save').onclick = () => {
+  const cfg = { client_id: $('#cid').value.trim(), client_secret: $('#csec').value.trim(), refresh_token: $('#rft').value.trim() };
+  if(!cfg.client_id || !cfg.client_secret || !cfg.refresh_token){ $('#cfgMsg').innerHTML='<span class="err">Champs manquants.</span>'; return; }
+  saveCfg(cfg);
+};
+
+$('#clear').onclick = () => { localStorage.removeItem('strava_cfg'); $('#cfgMsg').textContent='Supprimé.'; fillCfg(); };
+
+$('#upload').onclick = async () => {
+  $('#log').textContent='';
+  try{
+    const files = $('#files').files;
+    if(!files || !files.length){ log('❌ Choisis d’abord un ou plusieurs fichiers.'); return; }
+    const atk = await refreshAccessToken();
+    for(const f of files){
+      try{
+        log('↗︎ Envoi', f.name, '...');
+        const resp = await uploadFile(f, atk);
+        log('   → id', resp.id, resp.status || 'queued');
+      }catch(e){ log('⚠️', f.name, '→', e.message || e); }
+    }
+    log('✓ Terminé. Clique “Vérifier dernier statut” si besoin.');
+  }catch(e){ log('❌ ', e.message || e); }
+};
+
+$('#check').onclick = () => checkLast();
+
+// confort : préremplir si déjà sauvegardé
+fillCfg();
+
+// SW minimal pour “Ajouter à l’écran d’accueil”
+if('serviceWorker' in navigator){
+  const sw = URL.createObjectURL(new Blob([
+    `self.addEventListener('install',e=>self.skipWaiting());
+     self.addEventListener('activate',e=>self.clients.claim());`
+  ],{type:'text/javascript'}));
+  navigator.serviceWorker.register(sw);
+}
+</script>
+</body>
+</html>
+
