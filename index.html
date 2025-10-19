@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AutoSync Strava (PWA)</title>
+<meta name="theme-color" content="#ff5a36">
+<link rel="manifest" href="data:application/manifest+json,{&quot;name&quot;:&quot;AutoSync Strava&quot;,&quot;short_name&quot;:&quot;StravaSync&quot;,&quot;display&quot;:&quot;standalone&quot;,&quot;background_color&quot;:&quot;#0f0f10&quot;,&quot;theme_color&quot;:&quot;#ff5a36&quot;,&quot;icons&quot;:[{&quot;src&quot;:&quot;data:image/png;base64,iVBORw0KGgo=&quot;,&quot;sizes&quot;:&quot;192x192&quot;,&quot;type&quot;:&quot;image/png&quot;}]}">
+<style>
+:root{--bg:#0f0f10;--card:#1b1c20;--muted:#9aa0a6;--txt:#e8eaed;--ac:#ff5a36}
+*{box-sizing:border-box;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+body{margin:0;background:linear-gradient(180deg,#101113,#0b0c0d 40%);color:var(--txt)}
+.wrap{max-width:760px;margin:0 auto;padding:22px}
+h1{font-size:20px;margin:6px 0 14px}
+.card{background:var(--card);border:1px solid #2c2f36;border-radius:14px;padding:16px;margin:10px 0;box-shadow:0 8px 28px rgba(0,0,0,.35)}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.pill{display:inline-block;padding:6px 10px;border-radius:99px;background:#23262c;color:#b5bac1;font-size:12px}
+label{display:block;margin:10px 0 6px;color:var(--muted)}
+input[type="text"],input[type="password"]{width:100%;padding:12px;border-radius:10px;border:1px solid #2b2f36;background:#121316;color:var(--txt)}
+button{appearance:none;border:0;border-radius:12px;padding:11px 16px;background:var(--ac);color:#fff;font-weight:600}
+button.ghost{background:transparent;border:1px solid #394047;color:var(--txt)}
+small{color:var(--muted)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.ok{color:#37d67a}.err{color:#ff7b72;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🚀 AutoSync Strava (sans serveur)</h1>
+
+  <div class="card">
+    <div class="row"><span class="pill">Réglages</span><b>Identifiants Strava</b></div>
+    <label>Client ID</label><input id="cid" type="text" inputmode="numeric" placeholder="ex. 12345">
+    <label>Client Secret</label><input id="csec" type="password" placeholder="••••••••">
+    <label>Refresh Token</label><input id="rft" type="password" placeholder="refresh_token">
+    <div class="row" style="margin-top:12px">
+      <button id="saveCfg">💾 Enregistrer</button>
+      <button class="ghost" id="clearCfg">🧹 Effacer</button>
+      <small id="cfgMsg"></small>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row"><span class="pill">Accès dossier</span><b>Choisir “Téléchargements” (une fois)</b></div>
+    <small>Sur iOS, vous devrez appuyer une première fois pour accorder l’accès au dossier. Ensuite la synchro se lancera automatiquement à l’ouverture.</small><br><br>
+    <button id="pick">📂 Choisir le dossier…</button>
+    <button class="ghost" id="revoke">🔒 Retirer l’accès</button>
+    <div id="dirMsg" style="margin-top:10px"><small class="mono">Statut : inconnu</small></div>
+  </div>
+
+  <div class="card">
+    <div class="row"><span class="pill">Sync auto</span><b>Journal</b></div>
+    <div id="log" class="mono" style="white-space:pre-wrap;font-size:12px;line-height:1.4"></div>
+  </div>
+
+  <small>Astuce : ajoute cette page à l’écran d’accueil (Partager → “Sur l’écran d’accueil”). À chaque ouverture, la synchro démarre.</small>
+</div>
+
+<script>
+// ---------- utils UI ----------
+const q = s => document.querySelector(s);
+const log = (...m) => { const L=q('#log'); L.textContent += m.join(' ') + '\n'; };
+const saveCfgBtn = q('#saveCfg'), clearCfgBtn=q('#clearCfg'), cfgMsg=q('#cfgMsg');
+function loadCfg(){ try{return JSON.parse(localStorage.getItem('strava_cfg')||'{}')}catch{ return {} } }
+function saveCfg(cfg){ localStorage.setItem('strava_cfg', JSON.stringify(cfg)); cfgMsg.innerHTML='<span class="ok">✅ Clés enregistrées localement.</span>'; }
+function fillCfg(){ const c=loadCfg(); if(c.client_id) q('#cid').value=c.client_id; if(c.client_secret) q('#csec').value=c.client_secret; if(c.refresh_token) q('#rft').value=c.refresh_token; }
+
+// ---------- IDB pour stocker le handle ----------
+const DBNAME='strava-sync-db', STORE='handles';
+function idb(){
+  return new Promise((res,rej)=>{
+    const r = indexedDB.open(DBNAME,1);
+    r.onupgradeneeded = ()=> r.result.createObjectStore(STORE);
+    r.onsuccess = ()=> res(r.result);
+    r.onerror = ()=> rej(r.error);
+  });
+}
+async function putHandle(key, handle){
+  const db = await idb(); const tx = db.transaction(STORE,'readwrite');
+  tx.objectStore(STORE).put(handle, key);
+  return new Promise((res,rej)=>{ tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error); });
+}
+async function getHandle(key){
+  const db = await idb(); const tx = db.transaction(STORE,'readonly');
+  const req = tx.objectStore(STORE).get(key);
+  return new Promise((res,rej)=>{ req.onsuccess=()=>res(req.result); req.onerror=()=>rej(req.error); });
+}
+async function delHandle(key){
+  const db = await idb(); const tx = db.transaction(STORE,'readwrite');
+  tx.objectStore(STORE).delete(key);
+  return new Promise((res,rej)=>{ tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error); });
+}
+
+// ---------- Strava ----------
+async function refreshAccessToken(){
+  const c = loadCfg();
+  if(!c.client_id || !c.client_secret || !c.refresh_token) throw new Error('Renseigne Client ID, Secret, Refresh Token.');
+  const body = new URLSearchParams({
+    client_id: c.client_id, client_secret: c.client_secret,
+    grant_type: 'refresh_token', refresh_token: c.refresh_token
+  });
+  const r = await fetch('https://www.strava.com/oauth/token', {
+    method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body
+  });
+  const j = await r.json();
+  if(!r.ok){ throw new Error('Refresh token KO: '+(j.message||JSON.stringify(j))) }
+  return j.access_token;
+}
+
+function extToType(name){
+  const n = (name||'').toLowerCase();
+  if(n.endsWith('.gpx')) return 'gpx';
+  if(n.endsWith('.tcx')) return 'tcx';
+  return 'fit';
+}
+
+async function uploadToStrava(atk, file, name){
+  const fd = new FormData();
+  fd.append('file', file, file.name || 'activity.fit');
+  fd.append('data_type', extToType(file.name));
+  if(name) fd.append('name', name);
+  const r = await fetch('https://www.strava.com/api/v3/uploads', {
+    method:'POST', headers:{'Authorization':'Bearer '+atk}, body: fd
+  });
+  const j = await r.json();
+  if(!r.ok){ throw new Error(j.error||JSON.stringify(j)) }
+  return j; // {id, status,...}
+}
+
+// ---------- Dossier & synchro ----------
+const KEY = 'downloads_dir';
+async function pickDir(){
+  if(!window.showDirectoryPicker){ alert('Votre navigateur ne supporte pas l’accès direct au dossier. Utilisez Safari iOS 17+/Chrome 120+ ou Android Chrome.'); return; }
+  const dir = await window.showDirectoryPicker({ mode:'readwrite' });
+  await putHandle(KEY, dir);
+  q('#dirMsg').innerHTML = `<small class="ok mono">Accès accordé à: ${dir.name}</small>`;
+}
+
+async function revokeDir(){
+  await delHandle(KEY);
+  q('#dirMsg').innerHTML = `<small class="mono">Accès retiré.</small>`;
+}
+
+async function getSavedDir(){
+  try{
+    const dir = await getHandle(KEY);
+    if(!dir) return null;
+    const p = await dir.queryPermission({mode:'readwrite'});
+    if(p === 'granted') return dir;
+    // tenter d’obtenir sans repicker (certains Safari l’acceptent à l’ouverture)
+    const r = await dir.requestPermission({mode:'readwrite'});
+    return r === 'granted' ? dir : null;
+  }catch{ return null }
+}
+
+async function autoSync(){
+  const dir = await getSavedDir();
+  if(!dir){ q('#dirMsg').innerHTML='<small class="err">Pas d’accès au dossier. Appuie sur “Choisir le dossier…”.</small>'; return; }
+  q('#dirMsg').innerHTML = `<small class="ok mono">Accès: ${dir.name} — scan…</small>`;
+
+  const atk = await refreshAccessToken();
+
+  // Parcourir le dossier et envoyer tout ce qui finit par .fit/.gpx/.tcx
+  // (on pourrait garder une liste d’IDs traités; ici on tente l’upload, Strava dédoublonne)
+  for await (const [name, handle] of dir.entries()){
+    if(!name.match(/\.(fit|gpx|tcx)$/i)) continue;
+    try{
+      const f = await handle.getFile();
+      log('↗︎ Upload', name);
+      const resp = await uploadToStrava(atk, f, name.replace(/\.(fit|gpx|tcx)$/i,''));
+      log('  → id', resp.id, resp.status||'queued');
+
+      // Option : supprimer le fichier local après envoi
+      // (décommente si tu veux auto-nettoyer)
+      // await dir.removeEntry(name);
+
+    }catch(e){
+      log('⚠️', name, '→', e.message||e);
+    }
+  }
+  log('✓ Terminé.');
+}
+
+// ---------- UI events ----------
+saveCfgBtn.onclick = () => {
+  const cfg = {
+    client_id: q('#cid').value.trim(),
+    client_secret: q('#csec').value.trim(),
+    refresh_token: q('#rft').value.trim()
+  };
+  if(!cfg.client_id || !cfg.client_secret || !cfg.refresh_token){
+    cfgMsg.innerHTML = '<span class="err">Renseigne les trois champs.</span>'; return;
+  }
+  saveCfg(cfg);
+};
+clearCfgBtn.onclick = () => { localStorage.removeItem('strava_cfg'); cfgMsg.textContent='Effacé.'; };
+
+q('#pick').onclick = pickDir;
+q('#revoke').onclick = revokeDir;
+
+// Premier affichage + lancement auto à l’ouverture
+fillCfg();
+autoSync();
+
+// PWA service worker minimal (cache off; juste pour “Ajouter à l’écran d’accueil”)
+if('serviceWorker' in navigator){
+  const sw = URL.createObjectURL(new Blob([`self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>self.clients.claim());`],{type:'text/javascript'}));
+  navigator.serviceWorker.register(sw);
+}
+</script>
+</body>
+</html>
